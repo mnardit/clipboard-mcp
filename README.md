@@ -63,6 +63,9 @@ claude mcp add --scope user clipboard clipboard-mcp
 **Round-trip:**
 > "Get my clipboard, translate it to German, and set the translation back."
 
+**Step-by-step agent output via clipboard history:**
+> Run a multi-step task and `set_clipboard` after each step. With any clipboard manager (Paste, CopyQ, Klipper), you get a chronological log of every result — browse, search, and review the agent's work without switching windows.
+
 ## Platform Support
 
 - **Windows** (x86_64) — clipboard persists via OS pasteboard
