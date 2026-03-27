@@ -79,6 +79,12 @@ claude mcp add --scope user clipboard clipboard-mcp
 **Round-trip:**
 > "Get my clipboard, translate it to German, and set the translation back."
 
+**Data transform:**
+> Copy a CSV table → "Convert what's on my clipboard to JSON" → paste formatted JSON into your editor.
+
+**Code from clipboard:**
+> Copy a code snippet from a browser → "Review the code on my clipboard for bugs" → Claude reads it directly, no pasting into chat.
+
 **Step-by-step agent output via clipboard history:**
 > Run a multi-step task and `set_clipboard` after each step. With any clipboard manager (Paste, CopyQ, Klipper), you get a chronological log of every result — browse, search, and review the agent's work without switching windows.
 
