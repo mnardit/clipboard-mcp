@@ -2,7 +2,6 @@
 
 [![CI](https://github.com/mnardit/clipboard-mcp/workflows/CI/badge.svg)](https://github.com/mnardit/clipboard-mcp/actions)
 [![Crates.io](https://img.shields.io/crates/v/clipboard-mcp.svg)](https://crates.io/crates/clipboard-mcp)
-[![Downloads](https://img.shields.io/crates/d/clipboard-mcp.svg)](https://crates.io/crates/clipboard-mcp)
 [![License: MIT](https://img.shields.io/crates/l/clipboard-mcp.svg)](LICENSE)
 
 Cross-platform [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server that gives AI assistants direct read/write access to your system clipboard.
