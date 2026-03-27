@@ -1,8 +1,25 @@
 # clipboard-mcp
 
+[![CI](https://github.com/mnardit/clipboard-mcp/workflows/CI/badge.svg)](https://github.com/mnardit/clipboard-mcp/actions)
+[![Crates.io](https://img.shields.io/crates/v/clipboard-mcp.svg)](https://crates.io/crates/clipboard-mcp)
+[![Downloads](https://img.shields.io/crates/d/clipboard-mcp.svg)](https://crates.io/crates/clipboard-mcp)
+[![License: MIT](https://img.shields.io/crates/l/clipboard-mcp.svg)](LICENSE)
+
 Cross-platform [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server that gives AI assistants direct read/write access to your system clipboard.
 
 Copy an error → ask Claude to fix it → the fix lands in your clipboard. No manual paste into chat, no manual copy from response.
+
+```bash
+cargo install clipboard-mcp
+```
+
+## Why clipboard-mcp?
+
+- **Single binary** — no Python, no Node.js, no runtime to install
+- **Native clipboard** — uses [arboard](https://github.com/1Password/arboard) by 1Password, not shell commands like `pbcopy`/`xclip`
+- **Watch mode** — `watch_clipboard` lets agents react to what you copy in real-time
+- **Cross-platform** — Windows, macOS (Intel + Apple Silicon), Linux (X11 + Wayland)
+- **~250 lines of Rust** — small, auditable, no bloat
 
 ## Tools
 
