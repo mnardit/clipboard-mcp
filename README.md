@@ -4,7 +4,7 @@
 [![Crates.io](https://img.shields.io/crates/v/clipboard-mcp.svg)](https://crates.io/crates/clipboard-mcp)
 [![License: MIT](https://img.shields.io/crates/l/clipboard-mcp.svg)](LICENSE)
 
-Cross-platform [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server that gives AI assistants direct read/write access to your system clipboard.
+Cross-platform [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server that gives AI assistants direct read/write access to your system clipboard. **[Website](https://max.nardit.com/clipboard-mcp)**
 
 Copy an error → ask Claude to fix it → the fix lands in your clipboard. No manual paste into chat, no manual copy from response.
 
