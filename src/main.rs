@@ -1,21 +1,54 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use arboard::Clipboard;
+use clap::Parser;
 use rmcp::{
     handler::server::{tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router,
-    transport::stdio,
+    transport::{
+        stdio,
+        streamable_http_server::{
+            session::local::LocalSessionManager, StreamableHttpServerConfig,
+            StreamableHttpService,
+        },
+    },
     ErrorData, ServerHandler, ServiceExt,
 };
 use serde::Deserialize;
+use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
+use axum::middleware;
+
+/// Maximum concurrent watch_clipboard calls.
+static WATCH_SEMAPHORE: Semaphore = Semaphore::const_new(5);
 
 /// Maximum text size returned to the MCP client (100 KB).
 const MAX_TEXT_BYTES: usize = 100 * 1024;
 
 /// Maximum text size accepted by set_clipboard (1 MB).
 const MAX_SET_BYTES: usize = 1024 * 1024;
+
+// --- CLI ---
+
+/// Cross-platform MCP server for system clipboard access
+#[derive(Parser)]
+#[command(name = "clipboard-mcp", version)]
+struct Cli {
+    /// Run as HTTP server instead of stdio
+    #[arg(long)]
+    http: bool,
+
+    /// Port for HTTP server
+    #[arg(long, default_value = "3100")]
+    port: u16,
+
+    /// Bind address for HTTP server
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+}
 
 // --- Tool parameter types ---
 
@@ -48,11 +81,56 @@ fn read_clipboard_text() -> Result<Option<String>, ErrorData> {
     }
 }
 
-/// Read clipboard text on a blocking thread to avoid stalling the async executor.
+/// Read clipboard HTML synchronously. Returns `Ok(None)` if no HTML available.
+fn read_clipboard_html() -> Result<Option<String>, ErrorData> {
+    let mut clipboard = Clipboard::new().map_err(|e| {
+        ErrorData::internal_error(format!("Failed to access clipboard: {e}"), None)
+    })?;
+    match clipboard.get().html() {
+        Ok(html) => Ok(Some(html)),
+        Err(arboard::Error::ContentNotAvailable) => Ok(None),
+        Err(e) => Err(ErrorData::internal_error(
+            format!("Failed to read clipboard HTML: {e}"),
+            None,
+        )),
+    }
+}
+
+/// Read clipboard text on a blocking thread.
 async fn read_clipboard_async() -> Result<Option<String>, ErrorData> {
     tokio::task::spawn_blocking(read_clipboard_text)
         .await
         .map_err(|e| ErrorData::internal_error(format!("Task failed: {e}"), None))?
+}
+
+/// Read clipboard HTML on a blocking thread.
+async fn read_clipboard_html_async() -> Result<Option<String>, ErrorData> {
+    tokio::task::spawn_blocking(read_clipboard_html)
+        .await
+        .map_err(|e| ErrorData::internal_error(format!("Task failed: {e}"), None))?
+}
+
+/// Probe which clipboard formats are currently available.
+fn probe_clipboard_formats() -> Result<Vec<&'static str>, ErrorData> {
+    let mut cb = Clipboard::new().map_err(|e| {
+        ErrorData::internal_error(format!("Failed to access clipboard: {e}"), None)
+    })?;
+    let mut formats = Vec::new();
+
+    if cb.get_text().is_ok() {
+        formats.push("text");
+    }
+    if cb.get().html().is_ok() {
+        formats.push("html");
+    }
+    if cb.get_image().is_ok() {
+        formats.push("image");
+    }
+    if cb.get().file_list().is_ok() {
+        formats.push("files");
+    }
+
+    Ok(formats)
 }
 
 /// Truncate text at a char boundary.
@@ -67,7 +145,7 @@ fn truncate_text(text: &str, max_bytes: usize) -> (&str, bool) {
     (&text[..end], true)
 }
 
-/// Format clipboard text for the MCP response, truncating if needed.
+/// Format clipboard text for MCP response, truncating if needed.
 fn format_clipboard_response(text: String) -> CallToolResult {
     let (output, truncated) = truncate_text(&text, MAX_TEXT_BYTES);
     if truncated {
@@ -81,6 +159,20 @@ fn format_clipboard_response(text: String) -> CallToolResult {
 }
 
 // --- Server ---
+
+/// On Linux, tracks the thread holding the clipboard alive so we can unpark it.
+#[cfg(target_os = "linux")]
+static CLIPBOARD_THREAD: std::sync::Mutex<Option<std::thread::Thread>> =
+    std::sync::Mutex::new(None);
+
+/// Unpark and replace the previous Linux clipboard holder thread.
+#[cfg(target_os = "linux")]
+fn release_clipboard_thread() {
+    let mut guard = CLIPBOARD_THREAD.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(old) = guard.take() {
+        old.unpark();
+    }
+}
 
 #[derive(Clone)]
 struct ClipboardServer {
@@ -108,6 +200,61 @@ impl ClipboardServer {
         }
     }
 
+    #[tool(description = "Get HTML content from the system clipboard. \
+                          Returns the HTML markup if available, \
+                          or a message if no HTML content is on the clipboard.")]
+    async fn get_clipboard_html(&self) -> Result<CallToolResult, ErrorData> {
+        match read_clipboard_html_async().await? {
+            Some(html) if html.is_empty() => Ok(CallToolResult::success(vec![Content::text(
+                "[clipboard HTML is empty]",
+            )])),
+            Some(html) => Ok(format_clipboard_response(html)),
+            None => Ok(CallToolResult::success(vec![Content::text(
+                "[clipboard does not contain HTML content]",
+            )])),
+        }
+    }
+
+    #[tool(description = "List which content formats are currently on the clipboard. \
+                          Probes for text, HTML, image, and file list.")]
+    async fn list_clipboard_formats(&self) -> Result<CallToolResult, ErrorData> {
+        let formats = tokio::task::spawn_blocking(probe_clipboard_formats)
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("Task failed: {e}"), None))??;
+
+        if formats.is_empty() {
+            Ok(CallToolResult::success(vec![Content::text(
+                "[clipboard is empty — no formats detected]",
+            )]))
+        } else {
+            Ok(CallToolResult::success(vec![Content::text(format!(
+                "Available clipboard formats: {}",
+                formats.join(", ")
+            ))]))
+        }
+    }
+
+    #[tool(description = "Clear all content from the system clipboard")]
+    async fn clear_clipboard(&self) -> Result<CallToolResult, ErrorData> {
+        #[cfg(target_os = "linux")]
+        release_clipboard_thread();
+
+        tokio::task::spawn_blocking(|| {
+            let mut clipboard = Clipboard::new().map_err(|e| {
+                ErrorData::internal_error(format!("Failed to access clipboard: {e}"), None)
+            })?;
+            clipboard.clear().map_err(|e| {
+                ErrorData::internal_error(format!("Failed to clear clipboard: {e}"), None)
+            })
+        })
+        .await
+        .map_err(|e| ErrorData::internal_error(format!("Task failed: {e}"), None))??;
+
+        Ok(CallToolResult::success(vec![Content::text(
+            "Clipboard cleared",
+        )]))
+    }
+
     #[tool(description = "Set text content to the system clipboard")]
     async fn set_clipboard(
         &self,
@@ -124,15 +271,16 @@ impl ClipboardServer {
             ));
         }
 
-        // On Linux (X11/Wayland), the clipboard is owned by the process — content is
-        // lost when the Clipboard handle is dropped. We keep the handle alive on a
-        // background thread to persist the content until another app takes ownership.
-        // A oneshot channel reports success/failure before the thread parks.
         #[cfg(target_os = "linux")]
         {
+            // Use std::thread::spawn (NOT tokio spawn_blocking) because the thread
+            // parks to keep the X11/Wayland clipboard alive.
+            // Thread handle is sent back via oneshot so we can atomically replace
+            // the previous thread on the async side — no race between unpark and store.
             let text = args.text.clone();
-            let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
-            tokio::task::spawn_blocking(move || {
+            let (tx, rx) =
+                tokio::sync::oneshot::channel::<Result<std::thread::Thread, String>>();
+            std::thread::spawn(move || {
                 let mut clipboard = match Clipboard::new() {
                     Ok(c) => c,
                     Err(e) => {
@@ -140,34 +288,33 @@ impl ClipboardServer {
                         return;
                     }
                 };
-                match clipboard.set_text(&text) {
-                    Ok(()) => {
-                        let _ = tx.send(Ok(()));
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(format!("{e}")));
-                        return;
-                    }
+                if let Err(e) = clipboard.set_text(&text) {
+                    let _ = tx.send(Err(format!("{e}")));
+                    return;
                 }
-                // Keep Clipboard alive so X11/Wayland selection persists.
-                // Thread stays parked until process exits or a new set_clipboard
-                // call takes selection ownership (making this thread irrelevant).
+                // Send our handle back before parking.
+                let _ = tx.send(Ok(std::thread::current()));
                 std::thread::park();
             });
-            rx.await
+            let thread_handle = rx
+                .await
                 .map_err(|_| {
                     ErrorData::internal_error("Clipboard task failed".to_string(), None)
                 })?
                 .map_err(|e| {
-                    ErrorData::internal_error(
-                        format!("Failed to set clipboard: {e}"),
-                        None,
-                    )
+                    ErrorData::internal_error(format!("Failed to set clipboard: {e}"), None)
                 })?;
+            // Atomically replace: unpark old thread, store new one.
+            {
+                let mut guard = CLIPBOARD_THREAD
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(old) = guard.replace(thread_handle) {
+                    old.unpark();
+                }
+            }
         }
 
-        // On macOS/Windows, the OS pasteboard stores data server-side —
-        // content persists after Clipboard is dropped.
         #[cfg(not(target_os = "linux"))]
         {
             let text = args.text.clone();
@@ -222,6 +369,13 @@ impl ClipboardServer {
         &self,
         Parameters(args): Parameters<WatchClipboardArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        let _permit = WATCH_SEMAPHORE.try_acquire().map_err(|_| {
+            ErrorData::invalid_params(
+                "Too many concurrent watch_clipboard calls".to_string(),
+                None,
+            )
+        })?;
+
         let timeout_secs = args.timeout_secs.unwrap_or(30).min(300);
         let poll_interval = Duration::from_millis(500);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs as u64);
@@ -284,27 +438,100 @@ impl ServerHandler for ClipboardServer {
             ))
             .with_instructions(
                 "Cross-platform MCP server for system clipboard access. \
-                 Use get_clipboard to read, set_clipboard to write, \
-                 and watch_clipboard to wait for changes."
+                 Tools: get_clipboard, get_clipboard_html, set_clipboard, \
+                 watch_clipboard, list_clipboard_formats, clear_clipboard."
                     .to_string(),
             )
     }
 }
 
+/// Reject requests with an Origin header (browser-initiated).
+/// CORS headers only prevent reading responses — they don't block execution.
+/// This middleware blocks the request before any tool runs.
+async fn reject_browser_requests(
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> axum::response::Response {
+    if request.headers().contains_key("origin") {
+        return axum::response::Response::builder()
+            .status(403)
+            .body(axum::body::Body::from("Forbidden: browser requests not allowed"))
+            .unwrap();
+    }
+    next.run(request).await
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    // Prevent clap from writing --help/--version to stdout (corrupts MCP stdio).
+    let cli = Cli::try_parse().unwrap_or_else(|e| {
+        use clap::error::ErrorKind;
+        match e.kind() {
+            ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
+                eprintln!("{e}");
+                std::process::exit(0);
+            }
+            _ => {
+                let _ = e.print();
+                std::process::exit(e.exit_code());
+            }
+        }
+    });
+
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_ansi(false)
         .init();
 
-    tracing::info!("clipboard-mcp starting");
+    if cli.http {
+        let addr = format!("{}:{}", cli.host, cli.port);
 
-    let service = ClipboardServer::new()
-        .serve(stdio())
-        .await
-        .inspect_err(|e| tracing::error!("serving error: {e:?}"))?;
+        if cli.host != "127.0.0.1" && cli.host != "::1" && cli.host != "localhost" {
+            tracing::warn!(
+                "Binding to {} — clipboard is accessible from any reachable network interface. \
+                 Use 127.0.0.1 for local-only access.",
+                cli.host
+            );
+        }
 
-    service.waiting().await?;
+        tracing::info!("clipboard-mcp HTTP server starting on {addr}");
+
+        let ct = CancellationToken::new();
+        // Stateless mode: no session accumulation, ClipboardServer is stateless anyway.
+        let config = StreamableHttpServerConfig::default()
+            .with_stateful_mode(false)
+            .with_cancellation_token(ct.child_token());
+
+        let service = StreamableHttpService::new(
+            || Ok(ClipboardServer::new()),
+            Arc::new(LocalSessionManager::default()),
+            config,
+        );
+
+        // Reject any request with an Origin header to prevent browser-based attacks.
+        // CorsLayer only hides responses — this middleware blocks execution entirely.
+        let router = axum::Router::new()
+            .nest_service("/mcp", service)
+            .layer(middleware::from_fn(reject_browser_requests));
+        let listener = tokio::net::TcpListener::bind(&addr).await?;
+        tracing::info!("clipboard-mcp HTTP server listening on {addr}");
+
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async move {
+                tokio::signal::ctrl_c().await.ok();
+                ct.cancel();
+            })
+            .await?;
+    } else {
+        tracing::info!("clipboard-mcp starting (stdio)");
+
+        let service = ClipboardServer::new()
+            .serve(stdio())
+            .await
+            .inspect_err(|e| tracing::error!("serving error: {e:?}"))?;
+
+        service.waiting().await?;
+    }
+
     Ok(())
 }

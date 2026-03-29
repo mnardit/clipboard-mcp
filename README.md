@@ -17,16 +17,20 @@ cargo install clipboard-mcp
 - **Single binary** — no Python, no Node.js, no runtime to install
 - **Native clipboard** — uses [arboard](https://github.com/1Password/arboard) by 1Password, not shell commands like `pbcopy`/`xclip`
 - **Watch mode** — `watch_clipboard` lets agents react to what you copy in real-time
+- **HTML + format detection** — read HTML content, probe available clipboard formats
 - **Cross-platform** — Windows, macOS (Intel + Apple Silicon), Linux (X11 + Wayland)
-- **~250 lines of Rust** — small, auditable, no bloat
+- **HTTP transport** — run as a local HTTP server for remote agent access
 
 ## Tools
 
 | Tool | Description |
 |------|-------------|
 | `get_clipboard` | Read current text from the clipboard. Content over 100 KB is truncated. |
-| `set_clipboard` | Write text to the clipboard. |
-| `watch_clipboard` | Wait for clipboard text to change (default 30s, max 300s). Non-text changes reported as generic event. Changes reverting within 500ms poll interval may not be detected. |
+| `get_clipboard_html` | Read HTML content from the clipboard (e.g., rich text from browsers). |
+| `set_clipboard` | Write text to the clipboard (max 1 MB). |
+| `watch_clipboard` | Wait for clipboard text to change (default 30s, max 300s). Max 5 concurrent. |
+| `list_clipboard_formats` | Probe which formats are available (text, HTML, image, files). |
+| `clear_clipboard` | Clear all clipboard content. |
 
 ### watch_clipboard parameters
 
@@ -44,7 +48,7 @@ Or download a binary from [GitHub Releases](https://github.com/mnardit/clipboard
 
 ## Configuration
 
-### Claude Desktop
+### Claude Desktop (stdio, default)
 
 Add to `claude_desktop_config.json`:
 
@@ -58,7 +62,7 @@ Add to `claude_desktop_config.json`:
 }
 ```
 
-### Claude Code
+### Claude Code (stdio)
 
 ```bash
 # Add for current project
@@ -67,6 +71,18 @@ claude mcp add clipboard clipboard-mcp
 # Or add globally
 claude mcp add --scope user clipboard clipboard-mcp
 ```
+
+### HTTP Transport
+
+Run as an HTTP server for remote or programmatic access:
+
+```bash
+clipboard-mcp --http                          # 127.0.0.1:3100
+clipboard-mcp --http --port 8080              # custom port
+clipboard-mcp --http --host 0.0.0.0           # expose to network (see Security)
+```
+
+MCP endpoint: `http://HOST:PORT/mcp`
 
 ## Usage Examples
 
@@ -94,11 +110,11 @@ claude mcp add --scope user clipboard clipboard-mcp
 - **macOS** (x86_64, aarch64) — clipboard persists via OS pasteboard
 - **Linux** (x86_64, aarch64) — X11 and Wayland (via `wl-data-control` protocol)
 
-> **Linux note:** On Linux, clipboard content set by the server is handed off to your clipboard manager (KDE Klipper, GNOME Clipboard, clipman, etc.) when the selection is released. If no clipboard manager is running, content may not persist. All major desktop environments include one by default.
+> **Linux note:** On Linux, clipboard content set by the server is kept alive by a background thread. If no clipboard manager is running (bare WMs like i3/dwm), install `clipman`, `parcellite`, or `copyq`.
 
 ## How It Works
 
-Single binary. Uses [arboard](https://github.com/1Password/arboard) (by 1Password) for native clipboard access. Communicates via MCP protocol over stdio. No runtime dependencies on Windows and macOS; Linux requires X11 libs or a Wayland compositor with `wl-data-control` support.
+Single binary. Uses [arboard](https://github.com/1Password/arboard) (by 1Password) for native clipboard access. Communicates via MCP protocol over stdio (default) or HTTP (`--http` flag, Streamable HTTP transport). No runtime dependencies on Windows and macOS; Linux requires X11 libs or a Wayland compositor with `wl-data-control` support.
 
 ## Troubleshooting
 
@@ -115,11 +131,14 @@ Ensure the terminal running the MCP server has clipboard permissions in System S
 
 This server gives connected MCP clients full read/write access to your system clipboard:
 
-- **`get_clipboard`** returns whatever is currently on your clipboard
-- **`set_clipboard`** silently overwrites clipboard contents (max 1 MB)
-- **`watch_clipboard`** returns the next thing you copy, verbatim
+- **`get_clipboard`** / **`get_clipboard_html`** — return clipboard content verbatim
+- **`set_clipboard`** — silently overwrites clipboard contents (max 1 MB)
+- **`watch_clipboard`** — returns the next thing you copy, verbatim
+- **`clear_clipboard`** — wipes clipboard without confirmation
 
 Only connect this server to AI sessions you trust. Do not use it in environments where sensitive data (passwords, tokens) may be on the clipboard.
+
+**HTTP mode:** Default bind is `127.0.0.1` (localhost only). Binding to `0.0.0.0` with `--host` exposes clipboard to all reachable network interfaces. Browser-initiated requests (with `Origin` header) are rejected with 403. There is no authentication — non-browser HTTP clients are not restricted. For remote access, prefer SSH tunneling over exposing to the network.
 
 ## Contributing
 
